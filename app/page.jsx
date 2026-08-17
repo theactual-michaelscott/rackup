@@ -114,19 +114,41 @@ export default function App() {
   }
 
   async function ensureProfile() {
-    if (profile) return true;
+    const {
+      data: { user: currentUser },
+      error: userError,
+    } = await db.auth.getUser();
 
-    const username = `player${user.id.slice(0, 6)}`;
+    if (userError || !currentUser) {
+      setNotice('Your sign-in session has expired. Please sign out and sign in again.');
+      return false;
+    }
+
+    const username = `player${currentUser.id.slice(0, 6)}`;
+
     const result = await db
       .from('profiles')
-      .insert({ id: user.id, username, display_name: username });
+      .upsert(
+        {
+          id: currentUser.id,
+          username,
+          display_name: username,
+        },
+        { onConflict: 'id' }
+      );
 
     if (result.error) {
       setNotice(result.error.message);
       return false;
     }
 
-    setProfile({ id: user.id, username, display_name: username });
+    setUser(currentUser);
+    setProfile({
+      id: currentUser.id,
+      username,
+      display_name: username,
+    });
+
     return true;
   }
 
