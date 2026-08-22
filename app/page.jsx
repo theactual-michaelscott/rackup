@@ -102,12 +102,8 @@ export default function App() {
       password: data.get('password'),
     };
 
-    let result = await db.auth.signInWithPassword(credentials);
-    if (result.error) result = await db.auth.signUp(credentials);
+    const result = await db.auth.signInWithPassword(credentials);
     if (result.error) return setNotice(result.error.message);
-    if (!result.data.user) {
-      return setNotice('Check your email to confirm this test account, then sign in.');
-    }
 
     setUser(result.data.user);
     load(result.data.user.id);
