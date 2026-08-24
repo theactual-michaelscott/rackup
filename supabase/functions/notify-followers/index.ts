@@ -2,29 +2,46 @@
 // Rack Up — notify-followers Edge Function
 // ============================================================================
 // Triggered by the `on_check_in_created` database webhook (see
-// supabase/migrations/0003_checkin_webhook_trigger.sql). Given a newly
+// supabase/migrations/20260824_push_notification_backend.sql). Given a newly
 // created check-in, this function:
 //   1. Verifies the request actually came from the trusted webhook.
 //   2. Looks up who follows the player that just checked in.
 //   3. Filters out followers who muted "followed player checked in" alerts.
-//   4. Collects each remaining follower's registered device push tokens.
-//   5. Dedupes against `checkin_notifications` so retries never double-send.
-//   6. Sends batched Expo push notifications (max 100 messages/request,
-//      Expo's hard limit) and writes an audit row per recipient.
-//   7. Cleans up tokens Expo reports as permanently dead (DeviceNotRegistered).
+//   4. Collects each remaining follower's registered devices — Expo push
+//      tokens (future native app) AND Web Push subscriptions (existing
+//      Next.js web app) — a follower may have either, both, or neither.
+//   5. Dedupes per (check-in, follower, channel) so retries never double-send.
+//   6. Sends batched Expo push notifications (max 100/request, Expo's hard
+//      limit) and individual Web Push messages, writing an audit row per
+//      recipient per channel.
+//   7. Cleans up dead Expo tokens (DeviceNotRegistered) and expired/gone Web
+//      Push subscriptions (410 Gone / 404).
 //
-// Deploy:  supabase functions deploy notify-followers --no-verify-jwt=false
+// Deploy:  supabase functions deploy notify-followers
 // Secrets: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are injected
 //          automatically by the Supabase platform for every Edge Function.
-//          Optionally set EXPO_ACCESS_TOKEN (Expo push security) with:
-//          supabase secrets set EXPO_ACCESS_TOKEN=xxxxx
+//          Required for Web Push:
+//            supabase secrets set VAPID_PUBLIC_KEY=xxxxx
+//            supabase secrets set VAPID_PRIVATE_KEY=xxxxx
+//            supabase secrets set VAPID_SUBJECT=mailto:you@example.com
+//          Optional for Expo:
+//            supabase secrets set EXPO_ACCESS_TOKEN=xxxxx
 // ============================================================================
 
 import { createClient, type SupabaseClient } from "jsr:@supabase/supabase-js@2";
+import webpush from "npm:web-push@3.6.7";
 
 const EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send";
 const EXPO_BATCH_LIMIT = 100; // hard limit enforced by the Expo push API
 const EXPO_ACCESS_TOKEN = Deno.env.get("EXPO_ACCESS_TOKEN"); // optional
+
+const VAPID_PUBLIC_KEY = Deno.env.get("VAPID_PUBLIC_KEY");
+const VAPID_PRIVATE_KEY = Deno.env.get("VAPID_PRIVATE_KEY");
+const VAPID_SUBJECT = Deno.env.get("VAPID_SUBJECT");
+const webPushConfigured = Boolean(VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY && VAPID_SUBJECT);
+if (webPushConfigured) {
+  webpush.setVapidDetails(VAPID_SUBJECT!, VAPID_PUBLIC_KEY!, VAPID_PRIVATE_KEY!);
+}
 
 interface CheckInWebhookPayload {
   type: "INSERT";
@@ -57,9 +74,19 @@ interface ExpoPushTicket {
   details?: { error?: string };
 }
 
-interface FollowerRecipient {
-  followerId: string;
-  tokens: { id: string; expoPushToken: string }[];
+interface NotificationPayload {
+  title: string;
+  body: string;
+  data: Record<string, unknown>;
+}
+
+type AuditStatus = "sent" | "failed" | "skipped_no_token" | "skipped_muted";
+interface AuditRow {
+  check_in_id: string;
+  recipient_id: string;
+  push_token: string | null;
+  status: AuditStatus;
+  channel: "expo" | "web";
 }
 
 Deno.serve(async (req: Request) => {
@@ -118,6 +145,17 @@ async function handleNewCheckIn(
   const checkedInName = checkedInProfile.display_name || checkedInProfile.username;
   const venueName = venue?.name ?? "a venue";
 
+  const notification: NotificationPayload = {
+    title: "Rack Up",
+    body: `${checkedInName} just checked in at ${venueName}`,
+    data: {
+      type: "followed_checkin",
+      checkInId: record.id,
+      userId: record.user_id,
+      venueId: record.venue_id,
+    },
+  };
+
   // 2. Who follows this player, filtering out anyone who muted the alert.
   const { data: followerRows, error: followersError } = await supabase
     .from("follows")
@@ -133,86 +171,58 @@ async function handleNewCheckIn(
     return { checkInId: record.id, followers: 0, notified: 0, skipped: 0, failed: 0 };
   }
 
-  // 3. Dedupe: skip anyone already notified for this exact check-in
-  // (protects against webhook/network retries firing this function twice).
+  // 3. Dedupe per channel: skip (follower, channel) pairs already notified
+  // for this exact check-in (protects against webhook/network retries).
   const { data: alreadyNotified } = await supabase
     .from("checkin_notifications")
-    .select("recipient_id")
+    .select("recipient_id, channel")
     .eq("check_in_id", record.id)
     .in("recipient_id", eligibleFollowerIds);
 
-  const alreadyNotifiedIds = new Set((alreadyNotified ?? []).map((r) => r.recipient_id as string));
-  const pendingFollowerIds = eligibleFollowerIds.filter((id) => !alreadyNotifiedIds.has(id));
+  const notifiedKey = (recipientId: string, channel: string) => `${recipientId}:${channel}`;
+  const alreadyNotifiedKeys = new Set(
+    (alreadyNotified ?? []).map((r) => notifiedKey(r.recipient_id as string, r.channel as string)),
+  );
 
-  if (pendingFollowerIds.length === 0) {
-    return { checkInId: record.id, followers: eligibleFollowerIds.length, notified: 0, skipped: 0, failed: 0 };
-  }
-
-  // 4. Collect device tokens for the pending followers (a follower can have
-  // multiple devices; each gets its own message + audit row).
-  const { data: tokenRows, error: tokensError } = await supabase
-    .from("push_tokens")
-    .select("id, user_id, expo_push_token")
-    .in("user_id", pendingFollowerIds);
+  // 4. Collect Expo tokens + Web Push subscriptions for the eligible
+  // followers (skip a channel entirely if that follower/channel pair was
+  // already notified for this check-in).
+  const [{ data: tokenRows, error: tokensError }, { data: subRows, error: subsError }] =
+    await Promise.all([
+      supabase.from("push_tokens").select("id, user_id, expo_push_token").in("user_id", eligibleFollowerIds),
+      supabase
+        .from("web_push_subscriptions")
+        .select("id, user_id, endpoint, p256dh, auth")
+        .in("user_id", eligibleFollowerIds),
+    ]);
   if (tokensError) throw new Error(`could not load push tokens: ${tokensError.message}`);
+  if (subsError) throw new Error(`could not load web push subscriptions: ${subsError.message}`);
 
-  const recipients: FollowerRecipient[] = pendingFollowerIds.map((followerId) => ({
-    followerId,
-    tokens: (tokenRows ?? [])
-      .filter((t) => t.user_id === followerId)
-      .map((t) => ({ id: t.id, expoPushToken: t.expo_push_token })),
-  }));
-
-  // 5. Build one Expo message per (follower, device) pair; log followers
-  // with zero registered devices as "skipped_no_token" for observability.
-  const messages: (ExpoPushMessage & { __followerId: string; __tokenRowId: string })[] = [];
-  const auditRows: {
-    check_in_id: string;
-    recipient_id: string;
-    push_token: string | null;
-    status: "sent" | "failed" | "skipped_no_token" | "skipped_muted";
-  }[] = [];
-
-  for (const recipient of recipients) {
-    if (recipient.tokens.length === 0) {
-      auditRows.push({
-        check_in_id: record.id,
-        recipient_id: recipient.followerId,
-        push_token: null,
-        status: "skipped_no_token",
-      });
-      continue;
-    }
-    for (const token of recipient.tokens) {
-      messages.push({
-        to: token.expoPushToken,
-        title: "Rack Up",
-        body: `${checkedInName} just checked in at ${venueName}`,
-        sound: "default",
-        priority: "high",
-        channelId: "checkin-alerts", // Android; must match a channel created client-side
-        data: {
-          type: "followed_checkin",
-          checkInId: record.id,
-          userId: record.user_id,
-          venueId: record.venue_id,
-        },
-        __followerId: recipient.followerId,
-        __tokenRowId: token.id,
-      });
-    }
-  }
-
-  // 6. Send in batches of <=100 messages, tracking Expo's per-message ticket
-  // result so we know exactly which follower/device each outcome belongs to.
+  const auditRows: AuditRow[] = [];
   const deadTokenIds: string[] = [];
+  const deadSubscriptionIds: string[] = [];
   let sent = 0;
   let failed = 0;
 
-  for (let i = 0; i < messages.length; i += EXPO_BATCH_LIMIT) {
-    const batch = messages.slice(i, i + EXPO_BATCH_LIMIT);
-    const tickets = await sendExpoBatch(batch);
+  // 5a. Expo channel — batch send.
+  const expoJobs = (tokenRows ?? []).filter(
+    (t) => !alreadyNotifiedKeys.has(notifiedKey(t.user_id, "expo")),
+  );
+  const expoMessages = expoJobs.map((t) => ({
+    to: t.expo_push_token as string,
+    title: notification.title,
+    body: notification.body,
+    sound: "default" as const,
+    priority: "high" as const,
+    channelId: "checkin-alerts", // Android; must match a channel created client-side
+    data: notification.data,
+    __followerId: t.user_id as string,
+    __tokenRowId: t.id as string,
+  }));
 
+  for (let i = 0; i < expoMessages.length; i += EXPO_BATCH_LIMIT) {
+    const batch = expoMessages.slice(i, i + EXPO_BATCH_LIMIT);
+    const tickets = await sendExpoBatch(batch);
     tickets.forEach((ticket, idx) => {
       const message = batch[idx];
       if (ticket.status === "ok") {
@@ -222,6 +232,7 @@ async function handleNewCheckIn(
           recipient_id: message.__followerId,
           push_token: message.to,
           status: "sent",
+          channel: "expo",
         });
       } else {
         failed++;
@@ -233,24 +244,92 @@ async function handleNewCheckIn(
           recipient_id: message.__followerId,
           push_token: message.to,
           status: "failed",
+          channel: "expo",
         });
       }
     });
   }
 
-  // 7. Persist the audit/dedupe log. Conflicts (check_in_id, recipient_id)
-  // are ignored — a follower may appear once via "no token" and cannot also
-  // appear via "sent" in the same run, so this only guards cross-run retries.
+  // 5b. Web Push channel — one HTTP request per subscription.
+  const webJobs = (subRows ?? []).filter(
+    (s) => !alreadyNotifiedKeys.has(notifiedKey(s.user_id, "web")),
+  );
+  if (webJobs.length > 0 && !webPushConfigured) {
+    console.warn("Web Push subscriptions exist but VAPID_* secrets are not set; skipping web channel.");
+  }
+  if (webPushConfigured) {
+    await Promise.all(
+      webJobs.map(async (sub) => {
+        try {
+          await webpush.sendNotification(
+            {
+              endpoint: sub.endpoint as string,
+              keys: { p256dh: sub.p256dh as string, auth: sub.auth as string },
+            },
+            JSON.stringify(notification),
+          );
+          sent++;
+          auditRows.push({
+            check_in_id: record.id,
+            recipient_id: sub.user_id as string,
+            push_token: sub.endpoint as string,
+            status: "sent",
+            channel: "web",
+          });
+        } catch (err) {
+          failed++;
+          const statusCode = (err as { statusCode?: number }).statusCode;
+          if (statusCode === 404 || statusCode === 410) {
+            deadSubscriptionIds.push(sub.id as string);
+          }
+          auditRows.push({
+            check_in_id: record.id,
+            recipient_id: sub.user_id as string,
+            push_token: sub.endpoint as string,
+            status: "failed",
+            channel: "web",
+          });
+        }
+      }),
+    );
+  }
+
+  // 5c. Anyone eligible with zero devices on either channel: log once for
+  // observability (does not participate in per-channel dedupe above).
+  const notifiedFollowerIds = new Set([
+    ...expoJobs.map((t) => t.user_id as string),
+    ...webJobs.map((s) => s.user_id as string),
+  ]);
+  const alreadyNotifiedFollowerIds = new Set((alreadyNotified ?? []).map((r) => r.recipient_id as string));
+  for (const followerId of eligibleFollowerIds) {
+    if (!notifiedFollowerIds.has(followerId) && !alreadyNotifiedFollowerIds.has(followerId)) {
+      auditRows.push({
+        check_in_id: record.id,
+        recipient_id: followerId,
+        push_token: null,
+        status: "skipped_no_token",
+        channel: "expo",
+      });
+    }
+  }
+
+  // 6. Persist the audit/dedupe log. Conflicts on
+  // (check_in_id, recipient_id, channel) are ignored — guards cross-run
+  // retries only, since within a single run each channel is only attempted
+  // once per follower.
   if (auditRows.length > 0) {
     await supabase.from("checkin_notifications").upsert(auditRows, {
-      onConflict: "check_in_id,recipient_id",
+      onConflict: "check_in_id,recipient_id,channel",
       ignoreDuplicates: true,
     });
   }
 
-  // Drop tokens Expo says are permanently invalid (uninstalled app, etc.).
+  // Drop tokens/subscriptions the provider says are permanently dead.
   if (deadTokenIds.length > 0) {
     await supabase.from("push_tokens").delete().in("id", deadTokenIds);
+  }
+  if (deadSubscriptionIds.length > 0) {
+    await supabase.from("web_push_subscriptions").delete().in("id", deadSubscriptionIds);
   }
 
   return {

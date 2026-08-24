@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { createClient } from '@supabase/supabase-js';
+import { getExistingSubscription, pushSupported, subscribeToPush } from './lib/push';
 
 const db =
   process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
@@ -42,6 +43,8 @@ export default function App() {
   });
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
+  const [pushState, setPushState] = useState('unsupported'); // unsupported | off | on | busy
+  const [notifyToggleBusy, setNotifyToggleBusy] = useState(false);
 
   const mine = useMemo(() => live.find((checkIn) => checkIn.user_id === user?.id), [live, user]);
 
@@ -53,6 +56,47 @@ export default function App() {
       load(data.user?.id);
     });
   }, []);
+
+  useEffect(() => {
+    if (!pushSupported()) {
+      setPushState('unsupported');
+      return;
+    }
+
+    getExistingSubscription().then((subscription) => {
+      setPushState(subscription ? 'on' : 'off');
+    });
+  }, [user]);
+
+  async function enableBrowserAlerts() {
+    setPushState('busy');
+    const result = await subscribeToPush(db);
+
+    if (result.ok) {
+      setPushState('on');
+      setNotice('Browser alerts are on. You will be notified when someone you follow checks in.');
+    } else {
+      setPushState('off');
+      setNotice(result.error || 'Could not enable browser alerts.');
+    }
+  }
+
+  async function toggleFollowedCheckinAlerts(nextValue) {
+    if (!profile || notifyToggleBusy) return;
+
+    setNotifyToggleBusy(true);
+    const result = await db
+      .from('profiles')
+      .update({ notify_on_followed_checkin: nextValue })
+      .eq('id', profile.id);
+    setNotifyToggleBusy(false);
+
+    if (result.error) {
+      setNotice(result.error.message);
+    } else {
+      setProfile((current) => ({ ...current, notify_on_followed_checkin: nextValue }));
+    }
+  }
 
   async function load(id = user?.id) {
     if (!db) return;
@@ -330,6 +374,39 @@ export default function App() {
               {busy ? 'Going live…' : 'Go live'}
             </button>
           </div>
+        )}
+      </section>
+
+      <section className="notifications">
+        <p>ALERTS</p>
+        <h2>Get notified when a follow checks in.</h2>
+
+        {pushState === 'unsupported' && (
+          <p className="empty">Browser alerts aren&apos;t supported here yet — Rack Up&apos;s native app will cover this device.</p>
+        )}
+
+        {pushState !== 'unsupported' && (
+          <button
+            className="link"
+            disabled={pushState === 'busy' || pushState === 'on'}
+            onClick={enableBrowserAlerts}
+          >
+            {pushState === 'on' && 'Browser alerts are on'}
+            {pushState === 'off' && 'Enable browser alerts'}
+            {pushState === 'busy' && 'Enabling…'}
+          </button>
+        )}
+
+        {profile && (
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={profile.notify_on_followed_checkin !== false}
+              disabled={notifyToggleBusy}
+              onChange={(event) => toggleFollowedCheckinAlerts(event.target.checked)}
+            />
+            Notify me when someone I follow checks in
+          </label>
         )}
       </section>
 
