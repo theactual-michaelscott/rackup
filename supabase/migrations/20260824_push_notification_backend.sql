@@ -8,8 +8,8 @@ alter table public.profiles
 
 -- A followed player can see who follows them (remove a follower / block).
 -- Additive select policy alongside "users read their own follows".
-drop policy if exists "followed players read their followers" on public.follows;
-create policy "followed players read their followers"
+drop policy if exists "follows followed can read own followers" on public.follows;
+create policy "follows followed can read own followers"
 on public.follows for select
 using (auth.uid() = followed_id);
 
